@@ -15,7 +15,7 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
-	"github.com/ternary/custom-metric-prometheus/ternary"
+	"github.com/ternary/custom-metric-prometheus/pkg/ternary"
 )
 
 var (
@@ -104,6 +104,16 @@ func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) e
 		}
 		sort.Strings(labels)
 
+		// Create schema
+		schema := ternary.Schema{
+			"timestamp": ternary.FieldTypeTimestamp,
+			"value":     ternary.FieldTypeMeasure,
+		}
+		// Add all labels as dimensions
+		for _, label := range labels {
+			schema[label] = ternary.FieldTypeDimension
+		}
+
 		// Create a buffer to store CSV data
 		var buf bytes.Buffer
 		w := csv.NewWriter(&buf)
@@ -118,7 +128,9 @@ func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) e
 		// Write data rows
 		for _, point := range series.Values {
 			row := make([]string, 0, len(labels)+2)
-			row = append(row, fmt.Sprintf("%d", point.Timestamp.Unix()))
+			// Format timestamp in RFC3339
+			ts := time.Unix(int64(point.Timestamp), 0).UTC().Format(time.RFC3339)
+			row = append(row, ts)
 
 			// Add label values in the same order as headers
 			for _, label := range labels {
@@ -141,7 +153,7 @@ func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) e
 
 		// Create or update metric in Ternary
 		description := fmt.Sprintf("Prometheus metric %s from %s", metric, prometheusURL)
-		_, err := ternaryClient.FindOrCreateMetric(metric, description, tenantUUID, csvData)
+		_, err := ternaryClient.FindOrCreateMetric(metric, description, tenantUUID, csvData, schema)
 		if err != nil {
 			return fmt.Errorf("error creating/updating metric in Ternary: %v", err)
 		}

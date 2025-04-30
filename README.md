@@ -47,13 +47,17 @@ custom-metric-prometheus \
 The tool performs the following steps for each specified metric:
 
 1. Queries the Prometheus API for the metric's values over the past 24 hours
-2. Converts the data to CSV format, including:
-   - Timestamp (Unix epoch)
+2. Converts the data to CSV format with schema information:
+   - Timestamp (RFC3339 format, e.g., "2024-03-20T15:04:05Z")
    - All metric labels (e.g., instance, job, etc.)
    - Metric value
-3. Base64 encodes the CSV data
-4. Checks if a custom metric with the same name exists in Ternary
-   - If it exists: Updates the existing metric with new data
+3. Creates a schema mapping where:
+   - `timestamp` field is marked as TIMESTAMP
+   - `value` field is marked as MEASURE
+   - All other fields (labels) are marked as DIMENSION
+4. Base64 encodes the CSV data
+5. Checks if a custom metric with the same name exists in Ternary
+   - If it exists: Updates the existing metric with new data and schema
    - If not: Creates a new custom metric
 
 ## Example Data Format
@@ -62,7 +66,26 @@ Before base64 encoding, the CSV data looks like this:
 
 ```csv
 timestamp,DCGM_FI_DRIVER_VERSION,Hostname,UUID,__name__,device,gpu,instance,job,kubernetes_node,modelName,pci_bus_id,value
-1745982495,550.163.01,ip-192-168-102-213.ec2.internal,GPU-4a89731e-daf0-50b8-c9b4-ec2b28714713,DCGM_FI_DEV_GPU_TEMP,nvidia0,0,192.168.115.210:9400,gpu-metrics,ip-192-168-102-213.ec2.internal,NVIDIA A10G,00000000:00:1E.0,53
+2024-03-20T15:04:05Z,550.163.01,ip-192-168-102-213.ec2.internal,GPU-4a89731e-daf0-50b8-c9b4-ec2b28714713,DCGM_FI_DEV_GPU_TEMP,nvidia0,0,192.168.115.210:9400,gpu-metrics,ip-192-168-102-213.ec2.internal,NVIDIA A10G,00000000:00:1E.0,53
+```
+
+The corresponding schema would be:
+```json
+{
+  "timestamp": "TIMESTAMP",
+  "DCGM_FI_DRIVER_VERSION": "DIMENSION",
+  "Hostname": "DIMENSION",
+  "UUID": "DIMENSION",
+  "__name__": "DIMENSION",
+  "device": "DIMENSION",
+  "gpu": "DIMENSION",
+  "instance": "DIMENSION",
+  "job": "DIMENSION",
+  "kubernetes_node": "DIMENSION",
+  "modelName": "DIMENSION",
+  "pci_bus_id": "DIMENSION",
+  "value": "MEASURE"
+}
 ```
 
 ## Error Handling

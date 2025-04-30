@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Custom Metric Prometheus",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/custom-metric-prometheus",
+            "args": [
+                "--prometheus-url=http://localhost:9090",
+                "--metrics=DCGM_FI_DEV_GPU_TEMP",
+                "--metrics=DCGM_FI_DEV_POWER_USAGE",
+                "--tenant-uuid=454ba00b-c4e3-4c98-a64d-f656dd4a3eb6"
+            ],
+            "env": {
+                "TERNARY_TOKEN": "${input:ternaryToken}"
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "ternaryToken",
+            "type": "promptString",
+            "description": "Enter your Ternary API token",
+            "password": true
+        }
+    ]
+} 
