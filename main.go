@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/csv"
 	"fmt"
 	"os"
@@ -13,6 +15,7 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
+	"github.com/ternary/custom-metric-prometheus/ternary"
 )
 
 var (
@@ -33,13 +36,17 @@ func main() {
 	rootCmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Base URL of Prometheus server (required)")
 	rootCmd.Flags().StringSliceVar(&metrics, "metrics", []string{}, "List of metrics to fetch (required)")
 	rootCmd.Flags().StringVar(&ternaryURL, "ternary-url", "https://core-api.ternary.app", "Base URL of Ternary Core API")
-	rootCmd.Flags().StringVar(&ternaryToken, "ternary-token", "", "Ternary API token (required)")
+	rootCmd.Flags().StringVar(&ternaryToken, "ternary-token", os.Getenv("TERNARY_TOKEN"), "Ternary API token (required, can be set via TERNARY_TOKEN env var)")
 	rootCmd.Flags().StringVar(&tenantUUID, "tenant-uuid", "", "Tenant UUID (required)")
 
 	rootCmd.MarkFlagRequired("prometheus-url")
 	rootCmd.MarkFlagRequired("metrics")
-	rootCmd.MarkFlagRequired("ternary-token")
 	rootCmd.MarkFlagRequired("tenant-uuid")
+
+	// Only mark token as required if not set via environment variable
+	if ternaryToken == "" {
+		rootCmd.MarkFlagRequired("ternary-token")
+	}
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -48,22 +55,22 @@ func main() {
 }
 
 func run(cmd *cobra.Command, args []string) error {
-	client, err := api.NewClient(api.Config{
+	// Initialize Prometheus client
+	promClient, err := api.NewClient(api.Config{
 		Address: prometheusURL,
 	})
 	if err != nil {
-		return fmt.Errorf("error creating client: %v", err)
+		return fmt.Errorf("error creating Prometheus client: %v", err)
 	}
 
-	v1api := v1.NewAPI(client)
+	// Initialize Ternary client
+	ternaryClient := ternary.NewClient(ternaryURL, ternaryToken)
 
-	// Create CSV writer
-	w := csv.NewWriter(os.Stdout)
-	defer w.Flush()
+	v1api := v1.NewAPI(promClient)
 
 	// Process each metric
 	for _, metric := range metrics {
-		if err := processMetric(v1api, w, metric); err != nil {
+		if err := processMetric(v1api, ternaryClient, metric); err != nil {
 			return fmt.Errorf("error processing metric %s: %v", metric, err)
 		}
 	}
@@ -71,7 +78,7 @@ func run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func processMetric(v1api v1.API, w *csv.Writer, metric string) error {
+func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) error {
 	ctx := context.Background()
 	timeRange := fmt.Sprintf("%s[1d]", metric)
 	result, warnings, err := v1api.Query(ctx, timeRange, time.Now())
@@ -97,7 +104,11 @@ func processMetric(v1api v1.API, w *csv.Writer, metric string) error {
 		}
 		sort.Strings(labels)
 
-		// Write header if this is the first series
+		// Create a buffer to store CSV data
+		var buf bytes.Buffer
+		w := csv.NewWriter(&buf)
+
+		// Write header
 		header := append([]string{"timestamp"}, labels...)
 		header = append(header, "value")
 		if err := w.Write(header); err != nil {
@@ -118,6 +129,21 @@ func processMetric(v1api v1.API, w *csv.Writer, metric string) error {
 			if err := w.Write(row); err != nil {
 				return fmt.Errorf("error writing CSV row: %v", err)
 			}
+		}
+
+		w.Flush()
+		if err := w.Error(); err != nil {
+			return fmt.Errorf("error flushing CSV writer: %v", err)
+		}
+
+		// Encode CSV data as base64
+		csvData := base64.StdEncoding.EncodeToString(buf.Bytes())
+
+		// Create or update metric in Ternary
+		description := fmt.Sprintf("Prometheus metric %s from %s", metric, prometheusURL)
+		_, err := ternaryClient.FindOrCreateMetric(metric, description, tenantUUID, csvData)
+		if err != nil {
+			return fmt.Errorf("error creating/updating metric in Ternary: %v", err)
 		}
 	}
 
