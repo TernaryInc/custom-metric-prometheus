@@ -1,5 +1,7 @@
 # Custom Metric Prometheus
 
+EXPERIMENTAL. Use at your own risk.
+
 A command-line tool to fetch metrics from Prometheus and upload them to Ternary as custom metrics.
 
 ## Installation
