@@ -90,7 +90,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) error {
 	ctx := context.Background()
-	timeRange := fmt.Sprintf("%s[1d]", metric)
+	timeRange := fmt.Sprintf("avg_over_time(%s[1h])[7d:1h]", metric)
 	result, warnings, err := v1api.Query(ctx, timeRange, time.Now())
 	if err != nil {
 		return fmt.Errorf("error querying Prometheus: %v", err)
