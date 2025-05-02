@@ -32,7 +32,7 @@ type CustomMetric struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	TenantID string `json:"tenantID"`
-	CSVData  string `json:"csvData"`
+	CSV      string `json:"csv"`
 	Schema   Schema `json:"schema"`
 }
 
@@ -52,6 +52,11 @@ func NewClient(baseURL, token string) *Client {
 		httpClient: &http.Client{},
 		debug:      false,
 	}
+}
+
+// SetDebug sets the debug flag for the client
+func (c *Client) SetDebug(debug bool) {
+	c.debug = debug
 }
 
 // do performs an HTTP request and unmarshals the response into v
@@ -135,7 +140,7 @@ func (c *Client) UpdateCustomMetric(id string, metric *CustomMetric) error {
 		return fmt.Errorf("error marshaling request: %v", err)
 	}
 
-	endpoint := path.Join("/api/custom-metrics?customMetricID=%s", metric.ID)
+	endpoint := path.Join("/api/custom-metrics", metric.ID)
 	req, err := http.NewRequest("PATCH", c.baseURL+endpoint, bytes.NewBuffer(body))
 	if err != nil {
 		return fmt.Errorf("error creating request: %v", err)
@@ -156,7 +161,7 @@ func (c *Client) FindOrCreateMetric(name, description, tenantID, csvData string,
 	for _, m := range metrics.CustomMetrics {
 		if m.Name == name && m.TenantID == tenantID {
 			// Update existing metric with new CSV data and schema
-			m.CSVData = csvData
+			m.CSV = csvData
 			m.Schema = schema
 			if err := c.UpdateCustomMetric(m.TenantID, &m); err != nil {
 				return nil, fmt.Errorf("error updating metric: %v", err)
@@ -169,7 +174,7 @@ func (c *Client) FindOrCreateMetric(name, description, tenantID, csvData string,
 	newMetric := &CustomMetric{
 		Name:     name,
 		TenantID: tenantID,
-		CSVData:  csvData,
+		CSV:      csvData,
 		Schema:   schema,
 	}
 
