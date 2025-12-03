@@ -1,33 +1,32 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/csv"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+
+	"gocloud.dev/blob"
+	_ "gocloud.dev/blob/s3blob"
 
 	"github.com/prometheus/client_golang/api"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
-	"github.com/ternary/custom-metric-prometheus/pkg/ternary"
 )
 
-const rowLimit = 50_000 // unfixed backend error; can receive 413 entity too large error. Send 50,000 rows for now.
-
 var (
-	prometheusURL string
-	metrics       []string
-	ternaryURL    string
-	ternaryToken  string
-	tenantUUID    string
-	debug         bool
+	prometheusURL    string
+	cohort           string
+	metrics          []string
+	destination      string
+	prefix           string
+	referenceTimeStr string
 )
 
 func main() {
@@ -38,20 +37,11 @@ func main() {
 	}
 
 	rootCmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Base URL of Prometheus server (required)")
+	rootCmd.Flags().StringVar(&cohort, "cohort", "untitled", "Cohort or identifier to separate metrics deliveries from other origins")
 	rootCmd.Flags().StringSliceVar(&metrics, "metrics", []string{}, "List of metrics to fetch (required)")
-	rootCmd.Flags().StringVar(&ternaryURL, "ternary-url", "https://core-api.ternary.app", "Base URL of Ternary Core API")
-	rootCmd.Flags().StringVar(&ternaryToken, "ternary-token", os.Getenv("TERNARY_TOKEN"), "Ternary API token (required, can be set via TERNARY_TOKEN env var)")
-	rootCmd.Flags().StringVar(&tenantUUID, "tenant-uuid", "", "Tenant UUID (required)")
-	rootCmd.Flags().BoolVar(&debug, "debug", false, "Enable debug mode for API client")
-
-	rootCmd.MarkFlagRequired("prometheus-url")
-	rootCmd.MarkFlagRequired("metrics")
-	rootCmd.MarkFlagRequired("tenant-uuid")
-
-	// Only mark token as required if not set via environment variable
-	if ternaryToken == "" {
-		rootCmd.MarkFlagRequired("ternary-token")
-	}
+	rootCmd.Flags().StringVar(&destination, "dest", "", "Destination URL e.g. s3://bucket")
+	rootCmd.Flags().StringVar(&prefix, "prefix", "", "Destination prefix to write within bucket (optional)")
+	rootCmd.Flags().StringVar(&referenceTimeStr, "reference-time", "", "Metrics export as of this time (optional)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -68,29 +58,46 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("error creating Prometheus client: %v", err)
 	}
 
-	// Initialize Ternary client
-	ternaryClient := ternary.NewClient(ternaryURL, ternaryToken)
-	ternaryClient.SetDebug(debug)
-
 	v1api := v1.NewAPI(promClient)
 
-	// Process each metric
-	for i, metric := range metrics {
-		if i > 0 {
-			time.Sleep(3 * time.Second) // unfixed race condition posting many metrics at once
-		}
+	// we will always add a slash to the prefix so we don't have to check for it later
+	prefix = strings.TrimSuffix(prefix, "/")
 
-		if err := processMetric(v1api, ternaryClient, metric); err != nil {
-			return fmt.Errorf("error processing metric %s: %v", metric, err)
+	bucket, err := blob.OpenBucket(context.Background(), destination)
+	if err != nil {
+		return fmt.Errorf("error opening bucket: %v", err)
+	}
+
+	var referenceTime time.Time
+	if referenceTimeStr != "" {
+		referenceTime, err = time.Parse(time.DateOnly, referenceTimeStr)
+		if err != nil {
+			return fmt.Errorf("error parsing reference time: %v", err)
+		}
+	} else {
+		referenceTime = time.Now()
+	}
+
+	windows, err := getTimeRangeWindows(referenceTime)
+	if err != nil {
+		return fmt.Errorf("error getting time range windows: %v", err)
+	}
+
+	for _, window := range windows {
+		for _, metric := range metrics {
+			if err := processMetric(v1api, bucket, prefix, metric, window); err != nil {
+				return fmt.Errorf("error processing metric %s: %v", metric, err)
+			}
 		}
 	}
 
 	return nil
 }
 
-func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) error {
+func processMetric(v1api v1.API, bucket *blob.Bucket, prefix, metric string, window [2]time.Time) error {
 	ctx := context.Background()
-	timeRange := fmt.Sprintf("avg_over_time(%s[1h])[7d:1h]", metric)
+	filenameForWindow := fmt.Sprintf("%s/%s_%s_%s.csv", prefix, metric, cohort, window[0].Format(time.DateOnly))
+	timeRange := fmt.Sprintf("%s[1d]", metric)
 	result, warnings, err := v1api.Query(ctx, timeRange, time.Now())
 	if err != nil {
 		return fmt.Errorf("error querying Prometheus: %v", err)
@@ -111,35 +118,23 @@ func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) e
 		return fmt.Errorf("error creating temp file: %v", err)
 	}
 
-	var rowCount = 0
 	w := csv.NewWriter(temp)
 
-	// Create schema
-	schema := make(ternary.Schema)
-	var labels []string
-
 	// First pass to get metadata
+	var labels []string
 	for _, series := range matrix {
 		// Add all labels as dimensions
 		for label := range series.Metric {
 			// Protected BigQuery column name
 			if label != "__name__" {
-				schema[string(label)] = ternary.FieldTypeDimension
+				labels = append(labels, string(label))
 			}
 		}
 	}
-
-	for label := range schema {
-		labels = append(labels, label)
-	}
 	sort.Strings(labels)
 
-	// Don't include in `labels`
-	schema["timestamp"] = ternary.FieldTypeTimestamp
-	schema["value"] = ternary.FieldTypeMeasure
-
 	// Write header
-	header := append([]string{"timestamp", "value"}, labels...)
+	header := append([]string{"ChargePeriodStart", "MetricValue"}, labels...)
 	if err := w.Write(header); err != nil {
 		return fmt.Errorf("error writing CSV header: %v", err)
 	}
@@ -167,12 +162,6 @@ func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) e
 			if err := w.Write(row); err != nil {
 				return fmt.Errorf("error writing CSV row: %v", err)
 			}
-
-			rowCount++
-
-			if rowCount >= rowLimit {
-				break
-			}
 		}
 	}
 
@@ -192,23 +181,32 @@ func processMetric(v1api v1.API, ternaryClient *ternary.Client, metric string) e
 		return fmt.Errorf("error seeking temp file: %v", err)
 	}
 
-	// Encode CSV data as base64
-	var buf bytes.Buffer
-	csvEncoder := base64.NewEncoder(base64.StdEncoding, &buf)
-	if _, err := io.Copy(csvEncoder, temp); err != nil {
-		return fmt.Errorf("error encoding CSV data: %v", err)
-	}
-	if err := csvEncoder.Close(); err != nil {
-		return fmt.Errorf("error closing base64 encoder: %v", err)
-	}
-	csvData := buf.String()
-
-	// Create or update metric in Ternary
-	description := fmt.Sprintf("Prometheus metric %s from %s", metric, prometheusURL)
-	_, err = ternaryClient.FindOrCreateMetric(metric, description, tenantUUID, csvData, schema)
+	writer, err := bucket.NewWriter(ctx, filenameForWindow, nil)
 	if err != nil {
-		return fmt.Errorf("error creating/updating metric in Ternary: %v", err)
+		return fmt.Errorf("error writing to bucket: %v", err)
+	}
+
+	if _, err := io.Copy(writer, temp); err != nil {
+		return fmt.Errorf("error copying to bucket: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("error closing bucket writer: %v", err)
 	}
 
 	return nil
+}
+
+// getTimeRangeWindows will always return a slice of 2 windows:
+// - The complete previous window
+// - The current window
+// TODO: Add support for multi-day long windows. Without this, if we miss a daily run we'll have to backfill right away
+func getTimeRangeWindows(now time.Time) ([][2]time.Time, error) {
+	midnightToday := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	midnightYesterday := midnightToday.Add(-24 * time.Hour)
+	windows := [][2]time.Time{
+		{midnightYesterday, midnightToday},
+		{midnightToday, now},
+	}
+	return windows, nil
 }
