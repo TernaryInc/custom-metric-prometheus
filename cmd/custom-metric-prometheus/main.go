@@ -98,7 +98,7 @@ func processMetric(v1api v1.API, bucket *blob.Bucket, prefix, metric string, win
 	ctx := context.Background()
 	filenameForWindow := fmt.Sprintf("%s/%s_%s_%s.csv", prefix, metric, cohort, window[0].Format(time.DateOnly))
 	timeRange := fmt.Sprintf("%s[1d]", metric)
-	result, warnings, err := v1api.Query(ctx, timeRange, time.Now())
+	result, warnings, err := v1api.QueryRange(ctx, timeRange, v1.Range{Start: window[0], End: window[1]})
 	if err != nil {
 		return fmt.Errorf("error querying Prometheus: %v", err)
 	}
