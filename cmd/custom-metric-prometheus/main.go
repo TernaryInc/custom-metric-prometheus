@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +30,11 @@ var (
 	prefix           string
 	prometheusURL    string
 	referenceTimeStr string
+)
+
+const (
+	reservedColumnChargePeriodStart = "ChargePeriodStart" // reserved column name for Ternary BYOD
+	reservedColumnBQName            = "__name__"          // reserved column name for BQ
 )
 
 func main() {
@@ -106,11 +110,9 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("get time range windows: %v", err)
 	}
 
-	headers := append([]string{"ChargePeriodStart"}, metrics...)
-
 	for _, window := range windows {
 		for _, metric := range metrics {
-			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, headers, k8sClusterID, metric, window)
+			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, k8sClusterID, metric, window)
 			if err != nil {
 				return fmt.Errorf("export metric %s to CSV: %v", metric, err)
 			}
@@ -120,9 +122,9 @@ func run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, headers []string, k8sClusterID string, metric string, window window) error {
-	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metric, window.Start.Format(time.DateOnly))
-	timeRange := fmt.Sprintf("%s[1d]", metric)
+func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, window window) error {
+	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metricName, window.Start.Format(time.DateOnly))
+	timeRange := fmt.Sprintf("%s[1d]", metricName)
 
 	result, warnings, err := promAPI.QueryRange(ctx, timeRange, v1.Range{Start: window.Start, End: window.End})
 	if err != nil {
@@ -144,7 +146,6 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 
 	w := csv.NewWriter(temp)
 
-	// TODO: Implement labels.
 	// First pass to get metadata
 	var labels []string
 
@@ -152,27 +153,26 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 		// Add all labels as dimensions
 		for label := range series.Metric {
 			// Protected BigQuery column name
-			if label != "__name__" {
+			if label != reservedColumnBQName {
 				labels = append(labels, string(label))
 			}
 		}
 	}
+
 	sort.Strings(labels)
-	log.Printf("discovered labels for metric %s: %v", metric, labels)
+	log.Printf("discovered labels for metric %s: %v", metricName, labels)
+
+	headers := append([]string{"ChargePeriodStart"}, metricName)
+	headers = append(headers, labels...)
+
+	indexForHeaderColumn := make(map[string]int, len(headers))
+	for i, header := range headers {
+		indexForHeaderColumn[header] = i
+	}
 
 	// Write header
 	if err := w.Write(headers); err != nil {
 		return fmt.Errorf("write CSV header: %v", err)
-	}
-
-	chargePeriodStartIndex := slices.Index(headers, "ChargePeriodStart")
-	if chargePeriodStartIndex == -1 {
-		return fmt.Errorf("ChargePeriodStart not found in headers")
-	}
-
-	specificMetricIndex := slices.Index(headers, metric)
-	if specificMetricIndex == -1 {
-		return fmt.Errorf("metric name %s not found in headers", metric)
 	}
 
 	// Process each series in the matrix
@@ -183,13 +183,17 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 			ts := time.UnixMilli(int64(point.Timestamp)).UTC().Format(time.RFC3339)
 
 			row := make([]string, len(headers))
-			row[chargePeriodStartIndex] = ts
-			row[specificMetricIndex] = strconv.FormatFloat(float64(point.Value), 'f', -1, 64)
+			row[indexForHeaderColumn[reservedColumnChargePeriodStart]] = ts
+			row[indexForHeaderColumn[metricName]] = strconv.FormatFloat(float64(point.Value), 'f', -1, 64)
 
-			// TODO:Add label values in the same order as headers
-			// for _, label := range labels {
-			// 	row = append(row, string(series.Metric[model.LabelName(label)]))
-			// }
+			for _, label := range labels {
+				index, ok := indexForHeaderColumn[label]
+				if !ok {
+					return fmt.Errorf("label %s not found in headers", label)
+				}
+
+				row[index] = string(series.Metric[model.LabelName(label)])
+			}
 
 			if err := w.Write(row); err != nil {
 				return fmt.Errorf("write CSV row: %v", err)
