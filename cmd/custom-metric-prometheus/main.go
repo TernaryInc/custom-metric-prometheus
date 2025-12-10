@@ -5,7 +5,10 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
+	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,72 +24,95 @@ import (
 )
 
 var (
-	prometheusURL    string
-	cohort           string
-	metrics          []string
+	awsBucketRegion  string
 	destination      string
+	k8sClusterID     string
+	metrics          []string
 	prefix           string
+	prometheusURL    string
 	referenceTimeStr string
 )
 
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "custom-metric-prometheus",
-		Short: "A tool to fetch Prometheus metrics and convert them to CSV format",
+		Short: "A tool to fetch Prometheus metrics, convert them to CSV format, and deposit in blob storage.",
 		RunE:  run,
 	}
 
-	rootCmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Base URL of Prometheus server (required)")
-	rootCmd.Flags().StringVar(&cohort, "cohort", "untitled", "Cohort or identifier to separate metrics deliveries from other origins")
 	rootCmd.Flags().StringSliceVar(&metrics, "metrics", []string{}, "List of metrics to fetch (required)")
+	rootCmd.Flags().StringVar(&awsBucketRegion, "aws-bucket-region", "us-east-1", "If using an S3 destination bucket, specify the region")
 	rootCmd.Flags().StringVar(&destination, "dest", "", "Destination URL e.g. s3://bucket")
-	rootCmd.Flags().StringVar(&prefix, "prefix", "", "Destination prefix to write within bucket (optional)")
-	rootCmd.Flags().StringVar(&referenceTimeStr, "reference-time", "", "Metrics export as of this time (optional)")
+	rootCmd.Flags().StringVar(&k8sClusterID, "k8s-cluster-id", "__NO_K8S_CLUSTER_ID__", "Unique kubernetes cluster ID to disambiguate the output metrics file.")
+	rootCmd.Flags().StringVar(&prefix, "prefix", "", "Path prefix to write within bucket (optional)")
+	rootCmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Base URL of Prometheus server (required)")
+	rootCmd.Flags().StringVar(&referenceTimeStr, "reference-time", "", "Metrics export as of this date YYYY-MM-DD; current UTC+0 date by default (optional)")
 
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
+		log.Fatalf("execute root command: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run(cmd *cobra.Command, args []string) error {
-	// Initialize Prometheus client
-	promClient, err := api.NewClient(api.Config{
-		Address: prometheusURL,
-	})
-	if err != nil {
-		return fmt.Errorf("error creating Prometheus client: %v", err)
-	}
-
-	v1api := v1.NewAPI(promClient)
-
-	// we will always add a slash to the prefix so we don't have to check for it later
+func buildOpenBucketURL(dest, region, prefix string) (string, error) {
+	// Trim trailing slash from prefix
 	prefix = strings.TrimSuffix(prefix, "/")
 
-	bucket, err := blob.OpenBucket(context.Background(), destination)
+	// Parse destination URL
+	destURL, err := url.Parse(dest)
 	if err != nil {
-		return fmt.Errorf("error opening bucket: %v", err)
+		return "", fmt.Errorf("parse destination URL: %w", err)
 	}
 
-	var referenceTime time.Time
-	if referenceTimeStr != "" {
-		referenceTime, err = time.Parse(time.DateOnly, referenceTimeStr)
-		if err != nil {
-			return fmt.Errorf("error parsing reference time: %v", err)
+	// Build query parameters
+	query := destURL.Query()
+	query.Set("region", region)
+	query.Set("awssdk", "v2")
+	if prefix != "" {
+		query.Set("prefix", prefix)
+	}
+	destURL.RawQuery = query.Encode()
+
+	return destURL.String(), nil
+}
+
+func run(cmd *cobra.Command, args []string) error {
+	// Initialize Prometheus client
+	promHTTPClient, err := api.NewClient(api.Config{Address: prometheusURL})
+	if err != nil {
+		return fmt.Errorf("create Prometheus client: %v", err)
+	}
+
+	promAPI := v1.NewAPI(promHTTPClient)
+
+	bucketURL, err := buildOpenBucketURL(destination, awsBucketRegion, prefix)
+	if err != nil {
+		return err
+	}
+
+	bucket, err := blob.OpenBucket(cmd.Context(), bucketURL)
+	if err != nil {
+		return fmt.Errorf("open bucket: %v", err)
+	}
+	defer func() {
+		if err := bucket.Close(); err != nil {
+			log.Fatalf("close bucket: %v", err)
+			os.Exit(1)
 		}
-	} else {
-		referenceTime = time.Now()
+	}()
+
+	windows, err := getTimeRangeWindows(referenceTimeStr)
+	if err != nil {
+		return fmt.Errorf("get time range windows: %v", err)
 	}
 
-	windows, err := getTimeRangeWindows(referenceTime)
-	if err != nil {
-		return fmt.Errorf("error getting time range windows: %v", err)
-	}
+	headers := append([]string{"ChargePeriodStart"}, metrics...)
 
 	for _, window := range windows {
 		for _, metric := range metrics {
-			if err := processMetric(v1api, bucket, prefix, metric, window); err != nil {
-				return fmt.Errorf("error processing metric %s: %v", metric, err)
+			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, headers, k8sClusterID, metric, window)
+			if err != nil {
+				return fmt.Errorf("export metric %s to CSV: %v", metric, err)
 			}
 		}
 	}
@@ -94,17 +120,15 @@ func run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func processMetric(v1api v1.API, bucket *blob.Bucket, prefix, metric string, window [2]time.Time) error {
-	ctx := context.Background()
-	filenameForWindow := fmt.Sprintf("%s/%s_%s_%s.csv", prefix, metric, cohort, window[0].Format(time.DateOnly))
+func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, headers []string, k8sClusterID string, metric string, window window) error {
+	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metric, window.Start.Format(time.DateOnly))
 	timeRange := fmt.Sprintf("%s[1d]", metric)
-	result, warnings, err := v1api.QueryRange(ctx, timeRange, v1.Range{Start: window[0], End: window[1]})
-	if err != nil {
-		return fmt.Errorf("error querying Prometheus: %v", err)
-	}
 
-	if len(warnings) > 0 {
-		fmt.Fprintf(os.Stderr, "Warnings: %v\n", warnings)
+	result, warnings, err := promAPI.QueryRange(ctx, timeRange, v1.Range{Start: window.Start, End: window.End})
+	if err != nil {
+		return fmt.Errorf("query Prometheus: %v", err)
+	} else if len(warnings) > 0 {
+		log.Printf("Warnings: %v\n", warnings)
 	}
 
 	matrix, ok := result.(model.Matrix)
@@ -115,13 +139,15 @@ func processMetric(v1api v1.API, bucket *blob.Bucket, prefix, metric string, win
 	// Create a buffer to store CSV data
 	temp, err := os.CreateTemp("", "custom-metric-prometheus-*.csv")
 	if err != nil {
-		return fmt.Errorf("error creating temp file: %v", err)
+		return fmt.Errorf("create temp file: %v", err)
 	}
 
 	w := csv.NewWriter(temp)
 
+	// TODO: Implement labels.
 	// First pass to get metadata
 	var labels []string
+
 	for _, series := range matrix {
 		// Add all labels as dimensions
 		for label := range series.Metric {
@@ -132,11 +158,21 @@ func processMetric(v1api v1.API, bucket *blob.Bucket, prefix, metric string, win
 		}
 	}
 	sort.Strings(labels)
+	log.Printf("discovered labels for metric %s: %v", metric, labels)
 
 	// Write header
-	header := append([]string{"ChargePeriodStart", "MetricValue"}, labels...)
-	if err := w.Write(header); err != nil {
-		return fmt.Errorf("error writing CSV header: %v", err)
+	if err := w.Write(headers); err != nil {
+		return fmt.Errorf("write CSV header: %v", err)
+	}
+
+	chargePeriodStartIndex := slices.Index(headers, "ChargePeriodStart")
+	if chargePeriodStartIndex == -1 {
+		return fmt.Errorf("ChargePeriodStart not found in headers")
+	}
+
+	specificMetricIndex := slices.Index(headers, metric)
+	if specificMetricIndex == -1 {
+		return fmt.Errorf("metric name %s not found in headers", metric)
 	}
 
 	// Process each series in the matrix
@@ -146,21 +182,17 @@ func processMetric(v1api v1.API, bucket *blob.Bucket, prefix, metric string, win
 			// Format timestamp in RFC3339
 			ts := time.UnixMilli(int64(point.Timestamp)).UTC().Format(time.RFC3339)
 
-			row := make([]string, 0, len(labels)+2)
-			row = append(row, ts)
-			row = append(row, strconv.FormatFloat(float64(point.Value), 'f', -1, 64))
+			row := make([]string, len(headers))
+			row[chargePeriodStartIndex] = ts
+			row[specificMetricIndex] = strconv.FormatFloat(float64(point.Value), 'f', -1, 64)
 
-			// Add label values in the same order as headers
-			for _, label := range labels {
-				row = append(row, string(series.Metric[model.LabelName(label)]))
-			}
-
-			if len(header) != len(row) {
-				return fmt.Errorf("header and row length mismatch: %d != %d", len(header), len(row))
-			}
+			// TODO:Add label values in the same order as headers
+			// for _, label := range labels {
+			// 	row = append(row, string(series.Metric[model.LabelName(label)]))
+			// }
 
 			if err := w.Write(row); err != nil {
-				return fmt.Errorf("error writing CSV row: %v", err)
+				return fmt.Errorf("write CSV row: %v", err)
 			}
 		}
 	}
@@ -168,45 +200,72 @@ func processMetric(v1api v1.API, bucket *blob.Bucket, prefix, metric string, win
 	// Ensure all CSV data is written to the temp file
 	w.Flush()
 	if err := w.Error(); err != nil {
-		return fmt.Errorf("error flushing CSV writer: %v", err)
+		return fmt.Errorf("flush CSV writer: %v", err)
 	}
 
 	// Make sure to sync the file to disk
 	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("error syncing temp file: %v", err)
+		return fmt.Errorf("sync temp file: %v", err)
 	}
 
 	// Seek back to start of file
 	if _, err := temp.Seek(0, 0); err != nil {
-		return fmt.Errorf("error seeking temp file: %v", err)
+		return fmt.Errorf("seek temp file: %v", err)
 	}
 
-	writer, err := bucket.NewWriter(ctx, filenameForWindow, nil)
+	writer, err := bucket.NewWriter(ctx, filename, nil)
 	if err != nil {
-		return fmt.Errorf("error writing to bucket: %v", err)
+		return fmt.Errorf("initialize bucket writer: %v", err)
 	}
 
 	if _, err := io.Copy(writer, temp); err != nil {
-		return fmt.Errorf("error copying to bucket: %v", err)
+		return fmt.Errorf("copy to bucket: %v", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return fmt.Errorf("error closing bucket writer: %v", err)
+		return fmt.Errorf("close bucket writer: %v", err)
 	}
 
 	return nil
+}
+
+type window struct {
+	Start time.Time
+	End   time.Time
 }
 
 // getTimeRangeWindows will always return a slice of 2 windows:
 // - The complete previous window
 // - The current window
 // TODO: Add support for multi-day long windows. Without this, if we miss a daily run we'll have to backfill right away
-func getTimeRangeWindows(now time.Time) ([][2]time.Time, error) {
-	midnightToday := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	midnightYesterday := midnightToday.Add(-24 * time.Hour)
-	windows := [][2]time.Time{
-		{midnightYesterday, midnightToday},
-		{midnightToday, now},
+func getTimeRangeWindows(referenceTimeStr string) ([]window, error) {
+	referenceTime := time.Now().UTC()
+
+	if referenceTimeStr != "" {
+		tryReferenceTime, err := time.Parse(time.DateOnly, referenceTimeStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse reference time: %v", err)
+		}
+
+		referenceTime = tryReferenceTime
 	}
+
+	var (
+		referenceTimeUTC     = referenceTime.UTC()
+		startOfReferenceDate = time.Date(referenceTimeUTC.Year(), referenceTimeUTC.Month(), referenceTimeUTC.Day(), 0, 0, 0, 0, time.UTC)
+		startOfPreviousDay   = startOfReferenceDate.Add(-24 * time.Hour)
+		startOfNextDay       = startOfReferenceDate.Add(24 * time.Hour)
+		windows              = []window{
+			{
+				Start: startOfPreviousDay,
+				End:   startOfReferenceDate,
+			},
+			{
+				Start: startOfReferenceDate,
+				End:   startOfNextDay,
+			},
+		}
+	)
+
 	return windows, nil
 }

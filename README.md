@@ -17,32 +17,13 @@ go install github.com/ternary/custom-metric-prometheus@latest
 custom-metric-prometheus \
   --prometheus-url="http://prometheus:9090" \
   --metrics="DCGM_FI_DEV_GPU_TEMP" \
-  --metrics="DCGM_FI_DEV_GPU_UTIL" \
-  --ternary-token="your-token" \
-  --tenant-uuid="your-tenant-uuid"
-
-# Using environment variable for token
-export TERNARY_TOKEN="your-token"
-custom-metric-prometheus \
-  --prometheus-url="http://prometheus:9090" \
-  --metrics="DCGM_FI_DEV_GPU_TEMP" \
-  --tenant-uuid="your-tenant-uuid"
+  --metrics="DCGM_FI_DEV_GPU_UTIL"
 ```
 
 ### Required Flags
 
 - `--prometheus-url`: Base URL of your Prometheus server
 - `--metrics`: One or more metrics to fetch (can be specified multiple times)
-- `--ternary-token`: Your Ternary API token (can be set via TERNARY_TOKEN environment variable)
-- `--tenant-uuid`: Your Tenant UUID
-
-### Optional Flags
-
-- `--ternary-url`: Base URL of Ternary Core API (defaults to https://core-api.ternary.app)
-
-### Environment Variables
-
-- `TERNARY_TOKEN`: Can be used instead of the `--ternary-token` flag
 
 ## Operation
 
@@ -63,8 +44,6 @@ The tool performs the following steps for each specified metric:
    - If not: Creates a new custom metric
 
 ## Example Data Format
-
-Before base64 encoding, the CSV data looks like this:
 
 ```csv
 timestamp,DCGM_FI_DRIVER_VERSION,Hostname,UUID,__name__,device,gpu,instance,job,kubernetes_node,modelName,pci_bus_id,value
@@ -95,7 +74,6 @@ The corresponding schema would be:
 The tool includes comprehensive error handling for:
 - Prometheus API connection and query issues
 - CSV data formatting
-- Ternary API authentication and data submission
 - Network connectivity problems
 
 All errors are reported with descriptive messages to help diagnose issues.
