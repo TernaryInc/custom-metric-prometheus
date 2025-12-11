@@ -147,7 +147,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	for _, window := range windows {
 		for _, metric := range metrics {
-			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, k8sClusterID, metric, window)
+			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, k8sClusterID, metric, metrics, window)
 			if err != nil {
 				return fmt.Errorf("export metric %s to CSV: %v", metric, err)
 			}
@@ -176,16 +176,17 @@ func extractOrderedUniqueLabels(matrix model.Matrix) []string {
 }
 
 // buildCSVHeaders builds the CSV header row from metric name and labels
-func buildCSVHeaders(metricName string, labels []string) []string {
-	headers := make([]string, 0, len(labels)+2)
-	headers = append(headers, reservedColumnChargePeriodStart, metricName)
+func buildCSVHeaders(metrics []string, labels []string) []string {
+	headers := make([]string, 0, 1+len(metrics)+len(labels))
+	headers = append(headers, reservedColumnChargePeriodStart)
+	headers = append(headers, metrics...)
 	headers = append(headers, labels...)
 	return headers
 }
 
 // matrixToCSV converts a Prometheus matrix to CSV format and writes it to the provided writer
-func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, labels []string) error {
-	headers := buildCSVHeaders(metricName, labels)
+func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, allMetrics []string, labels []string) error {
+	headers := buildCSVHeaders(allMetrics, labels)
 	indexForHeaderColumn := make(map[string]int, len(headers))
 	for i, header := range headers {
 		indexForHeaderColumn[header] = i
@@ -226,7 +227,7 @@ func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, labels [
 	return nil
 }
 
-func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, window window) error {
+func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, allMetrics []string, window window) error {
 	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metricName, window.Start.Format(time.DateOnly))
 	query := metricName // QueryRange expects an instant vector, not a range vector
 
@@ -261,7 +262,7 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 	}()
 
 	w := csv.NewWriter(temp)
-	if err := matrixToCSV(w, matrix, metricName, labels); err != nil {
+	if err := matrixToCSV(w, matrix, metricName, allMetrics, labels); err != nil {
 		return fmt.Errorf("write matrix to CSV: %w", err)
 	}
 

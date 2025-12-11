@@ -54,7 +54,7 @@ The tool performs the following steps for each specified metric:
 
 ## Example Data Format
 
-```csv
+```tsv
 ChargePeriodStart	DCGM_FI_DEV_GPU_TEMP	Hostname	UUID	container	device	endpoint	gpu	instance	job	modelName	namespace	pci_bus_id	pod	service
 2025-12-10T00:00:00Z	22	ip-192-168-100-41.ec2.internal	GPU-be2af801-3af1-d8a0-98eb-ed03b2bb8673	exporter	nvidia0	metrics	0	192.168.113.133:9400	dcgm-exporter	Tesla T4	gpu-metrics	00000000:00:1E.0	dcgm-exporter-zvddj	dcgm-exporter
 ```

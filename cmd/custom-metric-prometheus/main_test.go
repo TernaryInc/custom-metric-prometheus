@@ -264,7 +264,7 @@ func TestBuildCSVHeaders(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildCSVHeaders(tt.metricName, tt.labels)
+			got := buildCSVHeaders([]string{tt.metricName}, tt.labels)
 			if len(got) != len(tt.want) {
 				t.Errorf("buildCSVHeaders() returned %d headers, want %d", len(got), len(tt.want))
 				return
@@ -357,7 +357,7 @@ func TestMatrixToCSV(t *testing.T) {
 			var buf strings.Builder
 			w := csv.NewWriter(&buf)
 
-			err := matrixToCSV(w, tt.matrix, tt.metricName, tt.labels)
+			err := matrixToCSV(w, tt.matrix, tt.metricName, []string{tt.metricName}, tt.labels)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("matrixToCSV() error = %v, wantErr %v", err, tt.wantErr)
 				return
