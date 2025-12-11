@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +25,7 @@ var (
 	awsBucketRegion  string
 	destination      string
 	k8sClusterID     string
+	labels           []string
 	metrics          []string
 	prefix           string
 	prometheusURL    string
@@ -34,7 +34,6 @@ var (
 
 const (
 	reservedColumnChargePeriodStart = "ChargePeriodStart" // reserved column name for Ternary BYOD
-	reservedColumnBQName            = "__name__"          // reserved column name for BQ
 )
 
 func main() {
@@ -45,6 +44,7 @@ func main() {
 	}
 
 	rootCmd.Flags().StringSliceVar(&metrics, "metrics", []string{}, "List of metrics to fetch (required)")
+	rootCmd.Flags().StringSliceVar(&labels, "labels", []string{}, "List of labels to include in CSV schema")
 	rootCmd.Flags().StringVar(&awsBucketRegion, "aws-bucket-region", "us-east-1", "If using an S3 destination bucket, specify the region")
 	rootCmd.Flags().StringVar(&destination, "dest", "", "Destination URL e.g. s3://bucket (required)")
 	rootCmd.Flags().StringVar(&k8sClusterID, "k8s-cluster-id", "", "Unique kubernetes cluster ID to disambiguate the output metrics file (required)")
@@ -116,6 +116,10 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--prometheus-url cannot be empty")
 	}
 
+	if len(labels) == 0 {
+		log.Printf("Warning: --labels is empty, CSV will not include any label columns")
+	}
+
 	// Initialize Prometheus client
 	promHTTPClient, err := api.NewClient(api.Config{Address: prometheusURL})
 	if err != nil {
@@ -147,7 +151,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	for _, window := range windows {
 		for _, metric := range metrics {
-			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, k8sClusterID, metric, metrics, window)
+			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, k8sClusterID, metric, metrics, labels, window)
 			if err != nil {
 				return fmt.Errorf("export metric %s to CSV: %v", metric, err)
 			}
@@ -155,24 +159,6 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-// extractOrderedUniqueLabels extracts unique label names from a Prometheus matrix, excluding reserved columns
-func extractOrderedUniqueLabels(matrix model.Matrix) []string {
-	uniqueLabelsSet := make(map[string]struct{})
-	for _, series := range matrix {
-		for label := range series.Metric {
-			if label != reservedColumnBQName {
-				uniqueLabelsSet[string(label)] = struct{}{}
-			}
-		}
-	}
-	uniqueLabelsSlice := make([]string, 0, len(uniqueLabelsSet))
-	for label := range uniqueLabelsSet {
-		uniqueLabelsSlice = append(uniqueLabelsSlice, label)
-	}
-	slices.Sort(uniqueLabelsSlice)
-	return uniqueLabelsSlice
 }
 
 // buildCSVHeaders builds the CSV header row from metric name and labels
@@ -227,7 +213,7 @@ func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, allMetri
 	return nil
 }
 
-func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, allMetrics []string, window window) error {
+func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, allMetrics []string, labels []string, window window) error {
 	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metricName, window.Start.Format(time.DateOnly))
 	query := metricName // QueryRange expects an instant vector, not a range vector
 
@@ -247,8 +233,6 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 	if !ok {
 		return fmt.Errorf("unexpected result type: %T", result)
 	}
-
-	labels := extractOrderedUniqueLabels(matrix)
 
 	// Create a temporary file to store CSV data
 	temp, err := os.CreateTemp("", "custom-metric-prometheus-*.csv")
