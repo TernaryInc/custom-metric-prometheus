@@ -20,7 +20,11 @@ custom-metric-prometheus \
   --k8s-cluster-id="gpu-demo" \
   --prefix="test-metrics-0/" \
   --metrics="DCGM_FI_DEV_GPU_TEMP" \
-  --metrics="DCGM_FI_DEV_GPU_UTIL"
+  --metrics="DCGM_FI_DEV_GPU_UTIL" \
+  --labels="instance" \
+  --labels="job" \
+  --labels="device" \
+  --labels="gpu"
 ```
 
 ### Required Flags
@@ -33,6 +37,7 @@ custom-metric-prometheus \
 
 ### Optional Flags
 
+- `--labels`: List of labels to include in CSV schema (can be specified multiple times). If not provided or empty, a warning will be logged and the CSV will not include any label columns.
 - `--aws-bucket-region`: AWS region for S3 bucket (default: `us-east-1`)
 - `--reference-time`: Metrics export as of this date in YYYY-MM-DD format; current UTC+0 date by default
 
@@ -46,9 +51,9 @@ The tool performs the following steps for each specified metric:
    - Uses 1-hour step intervals for data points
 2. Converts the data to CSV format with the following structure:
    - First column: `ChargePeriodStart` (RFC3339 format timestamp, e.g., "2024-03-20T15:04:05Z")
-   - Second column: Metric name (contains the metric value)
-   - Remaining columns: All metric labels (e.g., instance, job, device, gpu, etc.)
-   - Note: The `__name__` label is excluded from the CSV output
+   - Next columns: All metric names (one column per metric)
+   - Remaining columns: Labels declared via the `--labels` flag (e.g., instance, job, device, gpu, etc.)
+   - Note: The CSV schema is determined by the `--labels` flag. Labels not declared via `--labels` will not appear in the CSV output, even if they exist in the Prometheus data. If `--labels` is empty, a warning is logged and no label columns are included.
 3. Writes CSV files directly to blob storage (S3) with filenames in the format:
    `{k8s-cluster-id}_{metric-name}_{date}.csv`
 
@@ -61,8 +66,8 @@ ChargePeriodStart	DCGM_FI_DEV_GPU_TEMP	Hostname	UUID	container	device	endpoint	g
 
 The CSV format uses:
 - `ChargePeriodStart` as the timestamp column (reserved column name for Ternary BYOD)
-- The metric name as a column containing the metric values
-- All Prometheus labels as additional columns (excluding `__name__`)
+- The metric name(s) as column(s) containing the metric values
+- Labels declared via the `--labels` flag as additional columns. Only labels explicitly declared via `--labels` will appear in the CSV output.
 
 ## Error Handling
 
