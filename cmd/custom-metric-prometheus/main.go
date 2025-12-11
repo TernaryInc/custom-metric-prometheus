@@ -195,8 +195,11 @@ func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, allMetri
 				index, ok := indexForHeaderColumn[label]
 				if !ok {
 					return fmt.Errorf("label %s not found in headers", label)
+				} else if value := series.Metric[model.LabelName(label)]; value == "" {
+					continue
+				} else {
+					row[index] = string(value)
 				}
-				row[index] = string(series.Metric[model.LabelName(label)])
 			}
 
 			if err := w.Write(row); err != nil {
