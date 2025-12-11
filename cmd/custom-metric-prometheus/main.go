@@ -46,11 +46,28 @@ func main() {
 
 	rootCmd.Flags().StringSliceVar(&metrics, "metrics", []string{}, "List of metrics to fetch (required)")
 	rootCmd.Flags().StringVar(&awsBucketRegion, "aws-bucket-region", "us-east-1", "If using an S3 destination bucket, specify the region")
-	rootCmd.Flags().StringVar(&destination, "dest", "", "Destination URL e.g. s3://bucket")
-	rootCmd.Flags().StringVar(&k8sClusterID, "k8s-cluster-id", "__NO_K8S_CLUSTER_ID__", "Unique kubernetes cluster ID to disambiguate the output metrics file.")
-	rootCmd.Flags().StringVar(&prefix, "prefix", "", "Path prefix to write within bucket (optional)")
+	rootCmd.Flags().StringVar(&destination, "dest", "", "Destination URL e.g. s3://bucket (required)")
+	rootCmd.Flags().StringVar(&k8sClusterID, "k8s-cluster-id", "", "Unique kubernetes cluster ID to disambiguate the output metrics file (required)")
+	rootCmd.Flags().StringVar(&prefix, "prefix", "", "Path prefix to write within bucket (required)")
 	rootCmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Base URL of Prometheus server (required)")
 	rootCmd.Flags().StringVar(&referenceTimeStr, "reference-time", "", "Metrics export as of this date YYYY-MM-DD; current UTC+0 date by default (optional)")
+
+	// Mark required flags
+	if err := rootCmd.MarkFlagRequired("metrics"); err != nil {
+		log.Fatalf("metrics flag missing")
+	}
+	if err := rootCmd.MarkFlagRequired("dest"); err != nil {
+		log.Fatalf("dest flag missing")
+	}
+	if err := rootCmd.MarkFlagRequired("k8s-cluster-id"); err != nil {
+		log.Fatalf("k8s-cluster-id flag missing")
+	}
+	if err := rootCmd.MarkFlagRequired("prefix"); err != nil {
+		log.Fatalf("prefix flag missing")
+	}
+	if err := rootCmd.MarkFlagRequired("prometheus-url"); err != nil {
+		log.Fatalf("prometheus-url flag missing")
+	}
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("execute root command: %v", err)
@@ -81,6 +98,24 @@ func buildOpenBucketURL(dest, region, prefix string) (string, error) {
 }
 
 func run(cmd *cobra.Command, args []string) error {
+	// Validate that required flags have non-empty values
+	// (MarkFlagRequired only checks if flags are provided, not if they're non-empty)
+	if len(metrics) == 0 {
+		return fmt.Errorf("at least one metric must be specified with --metrics")
+	}
+	if destination == "" {
+		return fmt.Errorf("--dest cannot be empty")
+	}
+	if k8sClusterID == "" {
+		return fmt.Errorf("--k8s-cluster-id cannot be empty")
+	}
+	if prefix == "" {
+		return fmt.Errorf("--prefix cannot be empty")
+	}
+	if prometheusURL == "" {
+		return fmt.Errorf("--prometheus-url cannot be empty")
+	}
+
 	// Initialize Prometheus client
 	promHTTPClient, err := api.NewClient(api.Config{Address: prometheusURL})
 	if err != nil {
@@ -213,7 +248,6 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 	}
 
 	labels := extractOrderedUniqueLabels(matrix)
-	log.Printf("discovered labels for metric %s: %v", metricName, labels)
 
 	// Create a temporary file to store CSV data
 	temp, err := os.CreateTemp("", "custom-metric-prometheus-*.csv")
@@ -245,13 +279,14 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 		return fmt.Errorf("initialize bucket writer: %w", err)
 	}
 
-	if _, err := io.Copy(writer, temp); err != nil {
-		writer.Close()
-		return fmt.Errorf("copy to bucket: %w", err)
-	}
+	defer func() {
+		if err := writer.Close(); err != nil {
+			log.Fatalf("close bucket writer: %v", err)
+		}
+	}()
 
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("close bucket writer: %w", err)
+	if _, err := io.Copy(writer, temp); err != nil {
+		return fmt.Errorf("copy to bucket: %w", err)
 	}
 
 	return nil
