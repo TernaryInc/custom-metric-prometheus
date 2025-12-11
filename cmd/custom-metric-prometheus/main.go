@@ -201,7 +201,7 @@ func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, allMetri
 	for _, series := range matrix {
 		for _, point := range series.Values {
 			ts := time.UnixMilli(int64(point.Timestamp)).UTC().Format(time.RFC3339)
-			row := make([]string, len(headers))
+			row := initializeCSVRowWithNULLMarkers(len(headers))
 			row[indexForHeaderColumn[reservedColumnChargePeriodStart]] = ts
 			row[indexForHeaderColumn[metricName]] = strconv.FormatFloat(float64(point.Value), 'f', -1, 64)
 
@@ -335,4 +335,12 @@ func getTimeRangeWindowsWithTime(referenceTimeStr string, now time.Time) ([]wind
 	}
 
 	return windows, nil
+}
+
+func initializeCSVRowWithNULLMarkers(length int) []string {
+	row := make([]string, length)
+	for i := range row {
+		row[i] = "NULL"
+	}
+	return row
 }
