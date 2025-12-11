@@ -8,7 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -59,9 +59,6 @@ func main() {
 }
 
 func buildOpenBucketURL(dest, region, prefix string) (string, error) {
-	// Trim trailing slash from prefix
-	prefix = strings.TrimSuffix(prefix, "/")
-
 	// Parse destination URL
 	destURL, err := url.Parse(dest)
 	if err != nil {
@@ -73,7 +70,10 @@ func buildOpenBucketURL(dest, region, prefix string) (string, error) {
 	query.Set("region", region)
 	query.Set("awssdk", "v2")
 	if prefix != "" {
-		query.Set("prefix", prefix)
+		// Normalize prefix to always end with exactly one slash
+		// TrimRight removes all trailing slashes, then we add one back
+		normalizedPrefix := strings.TrimRight(prefix, "/") + "/"
+		query.Set("prefix", normalizedPrefix)
 	}
 	destURL.RawQuery = query.Encode()
 
@@ -91,7 +91,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	bucketURL, err := buildOpenBucketURL(destination, awsBucketRegion, prefix)
 	if err != nil {
-		return err
+		return fmt.Errorf("build open bucket URL: %w", err)
 	}
 
 	bucket, err := blob.OpenBucket(cmd.Context(), bucketURL)
@@ -122,49 +122,35 @@ func run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, window window) error {
-	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metricName, window.Start.Format(time.DateOnly))
-	timeRange := fmt.Sprintf("%s[1d]", metricName)
-
-	result, warnings, err := promAPI.QueryRange(ctx, timeRange, v1.Range{Start: window.Start, End: window.End})
-	if err != nil {
-		return fmt.Errorf("query Prometheus: %v", err)
-	} else if len(warnings) > 0 {
-		log.Printf("Warnings: %v\n", warnings)
-	}
-
-	matrix, ok := result.(model.Matrix)
-	if !ok {
-		return fmt.Errorf("unexpected result type: %T", result)
-	}
-
-	// Create a buffer to store CSV data
-	temp, err := os.CreateTemp("", "custom-metric-prometheus-*.csv")
-	if err != nil {
-		return fmt.Errorf("create temp file: %v", err)
-	}
-
-	w := csv.NewWriter(temp)
-
-	// First pass to get metadata
-	var labels []string
-
+// extractOrderedUniqueLabels extracts unique label names from a Prometheus matrix, excluding reserved columns
+func extractOrderedUniqueLabels(matrix model.Matrix) []string {
+	uniqueLabelsSet := make(map[string]struct{})
 	for _, series := range matrix {
-		// Add all labels as dimensions
 		for label := range series.Metric {
-			// Protected BigQuery column name
 			if label != reservedColumnBQName {
-				labels = append(labels, string(label))
+				uniqueLabelsSet[string(label)] = struct{}{}
 			}
 		}
 	}
+	uniqueLabelsSlice := make([]string, 0, len(uniqueLabelsSet))
+	for label := range uniqueLabelsSet {
+		uniqueLabelsSlice = append(uniqueLabelsSlice, label)
+	}
+	slices.Sort(uniqueLabelsSlice)
+	return uniqueLabelsSlice
+}
 
-	sort.Strings(labels)
-	log.Printf("discovered labels for metric %s: %v", metricName, labels)
-
-	headers := append([]string{"ChargePeriodStart"}, metricName)
+// buildCSVHeaders builds the CSV header row from metric name and labels
+func buildCSVHeaders(metricName string, labels []string) []string {
+	headers := make([]string, 0, len(labels)+2)
+	headers = append(headers, reservedColumnChargePeriodStart, metricName)
 	headers = append(headers, labels...)
+	return headers
+}
 
+// matrixToCSV converts a Prometheus matrix to CSV format and writes it to the provided writer
+func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, labels []string) error {
+	headers := buildCSVHeaders(metricName, labels)
 	indexForHeaderColumn := make(map[string]int, len(headers))
 	for i, header := range headers {
 		indexForHeaderColumn[header] = i
@@ -172,16 +158,13 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 
 	// Write header
 	if err := w.Write(headers); err != nil {
-		return fmt.Errorf("write CSV header: %v", err)
+		return fmt.Errorf("write CSV header: %w", err)
 	}
 
 	// Process each series in the matrix
 	for _, series := range matrix {
-		// Write data rows
 		for _, point := range series.Values {
-			// Format timestamp in RFC3339
 			ts := time.UnixMilli(int64(point.Timestamp)).UTC().Format(time.RFC3339)
-
 			row := make([]string, len(headers))
 			row[indexForHeaderColumn[reservedColumnChargePeriodStart]] = ts
 			row[indexForHeaderColumn[metricName]] = strconv.FormatFloat(float64(point.Value), 'f', -1, 64)
@@ -191,43 +174,84 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 				if !ok {
 					return fmt.Errorf("label %s not found in headers", label)
 				}
-
 				row[index] = string(series.Metric[model.LabelName(label)])
 			}
 
 			if err := w.Write(row); err != nil {
-				return fmt.Errorf("write CSV row: %v", err)
+				return fmt.Errorf("write CSV row: %w", err)
 			}
 		}
 	}
 
-	// Ensure all CSV data is written to the temp file
 	w.Flush()
 	if err := w.Error(); err != nil {
-		return fmt.Errorf("flush CSV writer: %v", err)
+		return fmt.Errorf("flush CSV writer: %w", err)
 	}
 
-	// Make sure to sync the file to disk
+	return nil
+}
+
+func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, window window) error {
+	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metricName, window.Start.Format(time.DateOnly))
+	query := metricName // QueryRange expects an instant vector, not a range vector
+
+	result, warnings, err := promAPI.QueryRange(ctx, query, v1.Range{
+		Start: window.Start,
+		End:   window.End,
+		Step:  1 * time.Hour,
+	})
+	if err != nil {
+		return fmt.Errorf("query Prometheus: %w", err)
+	}
+	if len(warnings) > 0 {
+		log.Printf("Warnings: %v\n", warnings)
+	}
+
+	matrix, ok := result.(model.Matrix)
+	if !ok {
+		return fmt.Errorf("unexpected result type: %T", result)
+	}
+
+	labels := extractOrderedUniqueLabels(matrix)
+	log.Printf("discovered labels for metric %s: %v", metricName, labels)
+
+	// Create a temporary file to store CSV data
+	temp, err := os.CreateTemp("", "custom-metric-prometheus-*.csv")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(temp.Name()); err != nil {
+			log.Printf("remove temp file %s: %v", temp.Name(), err)
+		}
+	}()
+
+	w := csv.NewWriter(temp)
+	if err := matrixToCSV(w, matrix, metricName, labels); err != nil {
+		return fmt.Errorf("write matrix to CSV: %w", err)
+	}
+
+	// Sync and seek back to start of file
 	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("sync temp file: %v", err)
+		return fmt.Errorf("sync temp file: %w", err)
 	}
-
-	// Seek back to start of file
 	if _, err := temp.Seek(0, 0); err != nil {
-		return fmt.Errorf("seek temp file: %v", err)
+		return fmt.Errorf("seek temp file: %w", err)
 	}
 
+	// Write to bucket
 	writer, err := bucket.NewWriter(ctx, filename, nil)
 	if err != nil {
-		return fmt.Errorf("initialize bucket writer: %v", err)
+		return fmt.Errorf("initialize bucket writer: %w", err)
 	}
 
 	if _, err := io.Copy(writer, temp); err != nil {
-		return fmt.Errorf("copy to bucket: %v", err)
+		writer.Close()
+		return fmt.Errorf("copy to bucket: %w", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return fmt.Errorf("close bucket writer: %v", err)
+		return fmt.Errorf("close bucket writer: %w", err)
 	}
 
 	return nil
@@ -244,32 +268,35 @@ type window struct {
 // TODO: Add support for multi-day long windows. Without this, if we miss a daily run we'll have to backfill right away
 func getTimeRangeWindows(referenceTimeStr string) ([]window, error) {
 	referenceTime := time.Now().UTC()
+	return getTimeRangeWindowsWithTime(referenceTimeStr, referenceTime)
+}
+
+// getTimeRangeWindowsWithTime is the testable version that accepts a reference time
+func getTimeRangeWindowsWithTime(referenceTimeStr string, now time.Time) ([]window, error) {
+	referenceTime := now.UTC()
 
 	if referenceTimeStr != "" {
 		tryReferenceTime, err := time.Parse(time.DateOnly, referenceTimeStr)
 		if err != nil {
-			return nil, fmt.Errorf("parse reference time: %v", err)
+			return nil, fmt.Errorf("parse reference time: %w", err)
 		}
-
-		referenceTime = tryReferenceTime
+		referenceTime = tryReferenceTime.UTC()
 	}
 
-	var (
-		referenceTimeUTC     = referenceTime.UTC()
-		startOfReferenceDate = time.Date(referenceTimeUTC.Year(), referenceTimeUTC.Month(), referenceTimeUTC.Day(), 0, 0, 0, 0, time.UTC)
-		startOfPreviousDay   = startOfReferenceDate.Add(-24 * time.Hour)
-		startOfNextDay       = startOfReferenceDate.Add(24 * time.Hour)
-		windows              = []window{
-			{
-				Start: startOfPreviousDay,
-				End:   startOfReferenceDate,
-			},
-			{
-				Start: startOfReferenceDate,
-				End:   startOfNextDay,
-			},
-		}
-	)
+	startOfReferenceDate := time.Date(referenceTime.Year(), referenceTime.Month(), referenceTime.Day(), 0, 0, 0, 0, time.UTC)
+	startOfPreviousDay := startOfReferenceDate.Add(-24 * time.Hour)
+	startOfNextDay := startOfReferenceDate.Add(24 * time.Hour)
+
+	windows := []window{
+		{
+			Start: startOfPreviousDay,
+			End:   startOfReferenceDate,
+		},
+		{
+			Start: startOfReferenceDate,
+			End:   startOfNextDay,
+		},
+	}
 
 	return windows, nil
 }
