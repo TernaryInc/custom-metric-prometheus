@@ -7,7 +7,7 @@ A command-line tool to fetch metrics from Prometheus, convert them to CSV format
 ## Installation
 
 ```bash
-go install github.com/ternary/custom-metric-prometheus@latest
+go install github.com/TernaryInc/custom-metric-prometheus@latest
 ```
 
 ## Usage

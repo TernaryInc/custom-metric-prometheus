@@ -1,4 +1,4 @@
-module github.com/ternary/custom-metric-prometheus
+module github.com/TernaryInc/custom-metric-prometheus
 
 go 1.25
 
