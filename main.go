@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +26,6 @@ var (
 	awsBucketRegion  string
 	destination      string
 	k8sClusterID     string
-	labels           []string
 	metrics          []string
 	prefix           string
 	prometheusURL    string
@@ -44,7 +44,6 @@ func main() {
 	}
 
 	rootCmd.Flags().StringSliceVar(&metrics, "metrics", []string{}, "List of metrics to fetch (required)")
-	rootCmd.Flags().StringSliceVar(&labels, "labels", []string{}, "List of labels to include in CSV schema")
 	rootCmd.Flags().StringVar(&awsBucketRegion, "aws-bucket-region", "us-east-1", "If using an S3 destination bucket, specify the region")
 	rootCmd.Flags().StringVar(&destination, "dest", "", "Destination URL e.g. s3://bucket (required)")
 	rootCmd.Flags().StringVar(&k8sClusterID, "k8s-cluster-id", "", "Unique kubernetes cluster ID to disambiguate the output metrics file (required)")
@@ -116,10 +115,6 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--prometheus-url cannot be empty")
 	}
 
-	if len(labels) == 0 {
-		log.Printf("Warning: --labels is empty, CSV will not include any label columns")
-	}
-
 	// Initialize Prometheus client
 	promHTTPClient, err := api.NewClient(api.Config{Address: prometheusURL})
 	if err != nil {
@@ -151,7 +146,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	for _, window := range windows {
 		for _, metric := range metrics {
-			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, k8sClusterID, metric, metrics, labels, window)
+			err := exportMetricToBucketCSV(cmd.Context(), promAPI, bucket, k8sClusterID, metric, window)
 			if err != nil {
 				return fmt.Errorf("export metric %s to CSV: %v", metric, err)
 			}
@@ -162,17 +157,30 @@ func run(cmd *cobra.Command, args []string) error {
 }
 
 // buildCSVHeaders builds the CSV header row from metric name and labels
-func buildCSVHeaders(metrics []string, labels []string) []string {
-	headers := make([]string, 0, 1+len(metrics)+len(labels))
-	headers = append(headers, reservedColumnChargePeriodStart)
-	headers = append(headers, metrics...)
-	headers = append(headers, labels...)
+func buildCSVHeaders(metricName string, matrix model.Matrix) []string {
+	labelsDeduper := make(map[string]struct{})
+
+	for _, series := range matrix {
+		for label := range series.Metric {
+			labelsDeduper[string(label)] = struct{}{}
+		}
+	}
+
+	uniqueLabels := make([]string, 0, len(labelsDeduper))
+	for label := range labelsDeduper {
+		uniqueLabels = append(uniqueLabels, label)
+	}
+	sort.Strings(uniqueLabels)
+
+	headers := make([]string, 0, 2+len(uniqueLabels))
+	headers = append(headers, reservedColumnChargePeriodStart, metricName)
+	headers = append(headers, uniqueLabels...)
 	return headers
 }
 
 // matrixToCSV converts a Prometheus matrix to CSV format and writes it to the provided writer
-func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, allMetrics []string, labels []string) error {
-	headers := buildCSVHeaders(allMetrics, labels)
+func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string) error {
+	headers := buildCSVHeaders(metricName, matrix)
 	indexForHeaderColumn := make(map[string]int, len(headers))
 	for i, header := range headers {
 		indexForHeaderColumn[header] = i
@@ -191,14 +199,17 @@ func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, allMetri
 			row[indexForHeaderColumn[reservedColumnChargePeriodStart]] = ts
 			row[indexForHeaderColumn[metricName]] = strconv.FormatFloat(float64(point.Value), 'f', -1, 64)
 
-			for _, label := range labels {
-				index, ok := indexForHeaderColumn[label]
+			for labelName, labelValue := range series.Metric {
+				labelNameStr := string(labelName)
+
+				index, ok := indexForHeaderColumn[labelNameStr]
 				if !ok {
-					return fmt.Errorf("label %s not found in headers", label)
-				} else if value := series.Metric[model.LabelName(label)]; value == "" {
+					return fmt.Errorf("label %s not found in headers", labelNameStr)
+				} else if labelValue == "" {
+					// treat empty label values as NULL
 					continue
 				} else {
-					row[index] = string(value)
+					row[index] = string(labelValue)
 				}
 			}
 
@@ -216,7 +227,7 @@ func matrixToCSV(w *csv.Writer, matrix model.Matrix, metricName string, allMetri
 	return nil
 }
 
-func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, allMetrics []string, labels []string, window window) error {
+func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.Bucket, k8sClusterID string, metricName string, window window) error {
 	filename := fmt.Sprintf("%s_%s_%s.csv", k8sClusterID, metricName, window.Start.Format(time.DateOnly))
 	query := metricName // QueryRange expects an instant vector, not a range vector
 
@@ -228,6 +239,7 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 	if err != nil {
 		return fmt.Errorf("query Prometheus: %w", err)
 	}
+
 	if len(warnings) > 0 {
 		log.Printf("Warnings: %v\n", warnings)
 	}
@@ -249,7 +261,7 @@ func exportMetricToBucketCSV(ctx context.Context, promAPI v1.API, bucket *blob.B
 	}()
 
 	w := csv.NewWriter(temp)
-	if err := matrixToCSV(w, matrix, metricName, allMetrics, labels); err != nil {
+	if err := matrixToCSV(w, matrix, metricName); err != nil {
 		return fmt.Errorf("write matrix to CSV: %w", err)
 	}
 

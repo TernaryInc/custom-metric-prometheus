@@ -167,32 +167,48 @@ func TestBuildCSVHeaders(t *testing.T) {
 	tests := []struct {
 		name       string
 		metricName string
-		labels     []string
+		matrix     model.Matrix
 		want       []string
 	}{
 		{
 			name:       "basic headers",
 			metricName: "cpu_usage",
-			labels:     []string{"instance", "job"},
-			want:       []string{"ChargePeriodStart", "cpu_usage", "instance", "job"},
+			matrix: model.Matrix{
+				&model.SampleStream{
+					Metric: model.Metric{
+						"instance": "localhost:9090",
+						"job":      "prometheus",
+					},
+				},
+			},
+			want: []string{"ChargePeriodStart", "cpu_usage", "instance", "job"},
 		},
 		{
 			name:       "no labels",
 			metricName: "simple_metric",
-			labels:     []string{},
+			matrix:     model.Matrix{},
 			want:       []string{"ChargePeriodStart", "simple_metric"},
 		},
 		{
 			name:       "many labels",
 			metricName: "complex_metric",
-			labels:     []string{"a", "b", "c", "d"},
-			want:       []string{"ChargePeriodStart", "complex_metric", "a", "b", "c", "d"},
+			matrix: model.Matrix{
+				&model.SampleStream{
+					Metric: model.Metric{
+						"a": "1",
+						"b": "2",
+						"c": "3",
+						"d": "4",
+					},
+				},
+			},
+			want: []string{"ChargePeriodStart", "complex_metric", "a", "b", "c", "d"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildCSVHeaders([]string{tt.metricName}, tt.labels)
+			got := buildCSVHeaders(tt.metricName, tt.matrix)
 			if len(got) != len(tt.want) {
 				t.Errorf("buildCSVHeaders() returned %d headers, want %d", len(got), len(tt.want))
 				return
@@ -211,14 +227,12 @@ func TestMatrixToCSV(t *testing.T) {
 		name       string
 		matrix     model.Matrix
 		metricName string
-		labels     []string
 		wantRows   int
 		wantErr    bool
 	}{
 		{
 			name:       "single series single point",
 			metricName: "test_metric",
-			labels:     []string{"instance"},
 			matrix: model.Matrix{
 				&model.SampleStream{
 					Metric: model.Metric{
@@ -238,7 +252,6 @@ func TestMatrixToCSV(t *testing.T) {
 		{
 			name:       "multiple series multiple points",
 			metricName: "test_metric",
-			labels:     []string{"instance"},
 			matrix: model.Matrix{
 				&model.SampleStream{
 					Metric: model.Metric{
@@ -273,7 +286,6 @@ func TestMatrixToCSV(t *testing.T) {
 		{
 			name:       "empty matrix",
 			metricName: "test_metric",
-			labels:     []string{},
 			matrix:     model.Matrix{},
 			wantRows:   1, // Just header
 			wantErr:    false,
@@ -285,7 +297,7 @@ func TestMatrixToCSV(t *testing.T) {
 			var buf strings.Builder
 			w := csv.NewWriter(&buf)
 
-			err := matrixToCSV(w, tt.matrix, tt.metricName, []string{tt.metricName}, tt.labels)
+			err := matrixToCSV(w, tt.matrix, tt.metricName)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("matrixToCSV() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -305,7 +317,14 @@ func TestMatrixToCSV(t *testing.T) {
 				// Verify header structure
 				if len(rows) > 0 {
 					headers := rows[0]
-					expectedHeaderLen := 2 + len(tt.labels) // ChargePeriodStart + metricName + labels
+					// Header should have ChargePeriodStart + metricName + labels from matrix
+					expectedLabels := make(map[string]struct{})
+					for _, series := range tt.matrix {
+						for label := range series.Metric {
+							expectedLabels[string(label)] = struct{}{}
+						}
+					}
+					expectedHeaderLen := 2 + len(expectedLabels) // ChargePeriodStart + metricName + labels
 					if len(headers) != expectedHeaderLen {
 						t.Errorf("Header length = %d, want %d", len(headers), expectedHeaderLen)
 					}
