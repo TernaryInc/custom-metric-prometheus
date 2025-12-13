@@ -11,10 +11,7 @@
                 "--prometheus-url=http://localhost:9090",
                 "--metrics=DCGM_FI_DEV_GPU_TEMP",
                 "--metrics=DCGM_FI_DEV_POWER_USAGE",
-            ],
-            "env": {
-                "TERNARY_TOKEN": "${input:ternaryToken}"
-            }
+            ]
         }
     ],
     "inputs": []
